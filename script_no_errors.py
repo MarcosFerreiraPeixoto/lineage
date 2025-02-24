@@ -2,6 +2,7 @@ import ast
 import inspect
 from textwrap import dedent
 from unittest.mock import MagicMock
+import builtins
 
 class SafeMock:
     def __init__(self, root=False, name=None, chain=None):
@@ -15,7 +16,8 @@ class SafeMock:
         self._chain = chain or []
         
     def __getattr__(self, name):
-        if len(self._chain) > 10:  # arbitrary limit to avoid runaway chains
+        # Limit chain length to avoid runaway recursion.
+        if len(self._chain) > 10:
             return self
         new_chain = self._chain + [name]
         return SafeMock(root=self._is_root, name=self.name, chain=new_chain)
@@ -32,6 +34,7 @@ class SafeMock:
             return f"<SafeMock: {self.name}.{chain_str}>"
         return f"<SafeMock: {chain_str}>"
 
+    # Basic operator overloads for safe arithmetic, comparisons, etc.
     def __gt__(self, other): return True
     def __lt__(self, other): return True
     def __ge__(self, other): return True
@@ -43,9 +46,8 @@ class SafeMock:
         return self
     def __next__(self):
         if self.index < 2:
-            result = self
             self.index += 1
-            return result
+            return self
         else:
             raise StopIteration
     def __setitem__(self, key, value):
@@ -58,7 +60,7 @@ class SafeMock:
         except KeyError:
             pass
     def __contains__(self, item):
-        return self
+        return True
     def __len__(self): return 0
     def __bool__(self): return True
     def __int__(self): return 0
@@ -125,11 +127,10 @@ class SafeMock:
 class TerminalSafeMock(SafeMock):
     """
     A terminal mock that does not record any further calls.
-    Inherits operator implementations from SafeMock.
     """
     def __init__(self):
         super().__init__()
-        self.terminal = True  # Always terminal
+        self.terminal = True
 
     def __call__(self, *args, **kwargs):
         return self
@@ -137,15 +138,31 @@ class TerminalSafeMock(SafeMock):
     def count(self):
         return 1
 
-# --- A helper to safely evaluate expressions ---
-def safe_eval(func):
-    try:
-        return func()
-    except Exception:
-        return SafeMock()
+# --- Custom global namespace that returns SafeMock for missing names ---
+class SafeExecutionNamespace(dict):
+    # Reserve these names so that lookups for built-ins (especially exceptions)
+    # return the real objects rather than SafeMock.
+    _reserved = {"Exception", "BaseException", "ArithmeticError", "LookupError",
+                 "AssertionError", "AttributeError", "EOFError", "FloatingPointError",
+                 "GeneratorExit", "ImportError", "ModuleNotFoundError", "IndexError",
+                 "KeyError", "KeyboardInterrupt", "MemoryError", "NameError", "NotImplementedError",
+                 "OSError", "OverflowError", "RecursionError", "ReferenceError", "RuntimeError",
+                 "StopIteration", "StopAsyncIteration", "SyntaxError", "IndentationError",
+                 "TabError", "SystemError", "SystemExit", "TypeError", "UnboundLocalError",
+                 "UnicodeError", "UnicodeEncodeError", "UnicodeDecodeError", "UnicodeTranslateError",
+                 "ValueError", "ZeroDivisionError"}
+    
+    def __missing__(self, key):
+        if key in self._reserved:
+            # Return the actual built-in exception type.
+            return getattr(builtins, key)
+        new_mock = SafeMock(name=key)
+        self[key] = new_mock
+        return new_mock
 
 def create_mock_namespace():
-    """Creates execution namespace with mock tracking."""
+    """Creates a global namespace for execution that automatically supplies SafeMock
+    instances for any missing variable. Also includes our mock tracking functions."""
     mock_registry = []
     
     def create_and_register_mock(func_name):
@@ -153,7 +170,7 @@ def create_mock_namespace():
             remove_self = kwargs.pop("__remove_self", False)
             if remove_self and args:
                 caller = args[0]
-                args = args[1:]  # Remove the instance parameter
+                args = args[1:]
                 caller_name = caller.name if isinstance(caller, SafeMock) else "unknown"
             else:
                 caller_name = "direct_call"
@@ -164,37 +181,27 @@ def create_mock_namespace():
             return new_mock
         return wrapper
 
-    builtins_dict = (vars(__builtins__).copy() 
-                     if inspect.ismodule(__builtins__) 
-                     else __builtins__.copy())
-    
-    return {
+    # Explicitly add some built-in exception types and other builtins.
+    initial_namespace = {
         'mock_registry': mock_registry,
         'create_and_register_mock': create_and_register_mock,
         'MagicMock': MagicMock,
         'SafeMock': SafeMock,
         'TerminalSafeMock': TerminalSafeMock,
-        'safe_eval': safe_eval,
-        '__builtins__': builtins_dict
+        'Exception': builtins.Exception,
+        'BaseException': builtins.BaseException,
+        '__builtins__': builtins.__dict__
     }
+    
+    return SafeExecutionNamespace(initial_namespace)
 
 class ASTTransformer(ast.NodeTransformer):
-    """Transforms AST to mock targets, imports, and tracks mocks."""
+    """Transforms the AST to intercept target function/method calls and wraps
+    assignments in try/except blocks so that errors result in a SafeMock being
+    assigned instead of stopping execution."""
     def __init__(self, target_functions, defined_names):
         self.target_functions = target_functions
         self.defined_names = defined_names
-
-    def wrap_with_safe_eval(self, expr):
-        # Wraps an expression in a lambda passed to safe_eval
-        lambda_expr = ast.Lambda(
-            args=ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], defaults=[]),
-            body=expr
-        )
-        return ast.Call(
-            func=ast.Name(id='safe_eval', ctx=ast.Load()),
-            args=[lambda_expr],
-            keywords=[]
-        )
 
     def visit_Module(self, node):
         self.generic_visit(node)
@@ -213,8 +220,7 @@ class ASTTransformer(ast.NodeTransformer):
                 name=None,
                 body=[ast.Pass()]
             )],
-            orelse=[],
-            finalbody=[]
+            orelse=[], finalbody=[]
         )
         false_try = ast.Try(
             body=false_body,
@@ -223,8 +229,7 @@ class ASTTransformer(ast.NodeTransformer):
                 name=None,
                 body=[ast.Pass()]
             )],
-            orelse=[],
-            finalbody=[]
+            orelse=[], finalbody=[]
         )
         node.body = [true_try]
         node.orelse = [false_try]
@@ -233,38 +238,31 @@ class ASTTransformer(ast.NodeTransformer):
 
     def visit_Call(self, node):
         node = self.generic_visit(node)
-        # Handle method calls on attributes (e.g. self.writer.saveAsTable(...))
+        # Intercept method calls on attributes.
         if isinstance(node.func, ast.Attribute) and node.func.attr in self.target_functions:
             new_func = ast.Call(
                 func=ast.Name(id='create_and_register_mock', ctx=ast.Load()),
                 args=[ast.Constant(value=node.func.attr)],
                 keywords=[]
             )
-            # Wrap the instance and each argument with safe_eval to catch errors during evaluation.
-            new_instance = self.wrap_with_safe_eval(node.func.value)
-            new_args = [new_instance] + [self.wrap_with_safe_eval(arg) for arg in node.args]
-            new_keywords = [ast.keyword(arg=kw.arg, value=self.wrap_with_safe_eval(kw.value))
-                            for kw in node.keywords]
-            new_keywords.append(ast.keyword(arg="__remove_self", value=ast.Constant(value=True)))
+            new_args = [node.func.value] + node.args
+            new_keywords = node.keywords + [ast.keyword(arg="__remove_self", value=ast.Constant(value=True))]
             return ast.copy_location(ast.Call(
                 func=new_func,
                 args=new_args,
                 keywords=new_keywords
             ), node)
-        # Handle direct function calls (e.g. load(...))
+        # Intercept direct function calls.
         if isinstance(node.func, ast.Name) and node.func.id in self.target_functions:
-            new_args = [self.wrap_with_safe_eval(arg) for arg in node.args]
-            new_keywords = [ast.keyword(arg=kw.arg, value=self.wrap_with_safe_eval(kw.value))
-                            for kw in node.keywords]
-            return ast.copy_location(ast.Call(
+            return ast.Call(
                 func=ast.Call(
                     func=ast.Name(id='create_and_register_mock', ctx=ast.Load()),
                     args=[ast.Constant(value=node.func.id)],
                     keywords=[]
                 ),
-                args=new_args,
-                keywords=new_keywords
-            ), node)
+                args=node.args,
+                keywords=node.keywords
+            )
         return node
 
     def visit_Import(self, node):
@@ -288,8 +286,11 @@ class ASTTransformer(ast.NodeTransformer):
                     ]
                 )
             ))
-        return new_nodes if len(new_nodes) > 1 else new_nodes[0] if new_nodes else None
+        if len(new_nodes) == 1:
+            return new_nodes[0]
+        return new_nodes
 
+    # Wrap assignment nodes so that if evaluation fails, a SafeMock is assigned.
     def visit_Assign(self, node):
         self.generic_visit(node)
         try_body = [node]
@@ -323,8 +324,7 @@ class ASTTransformer(ast.NodeTransformer):
                 name=None,
                 body=except_body
             )],
-            orelse=[],
-            finalbody=[]
+            orelse=[], finalbody=[]
         )
         return ast.copy_location(try_except_node, node)
 
@@ -333,19 +333,17 @@ class ASTTransformer(ast.NodeTransformer):
         try_body = [node]
         target = node.target
         if isinstance(target, ast.Name):
-            except_body = [
-                ast.Assign(
-                    targets=[ast.copy_location(ast.Name(id=target.id, ctx=ast.Store()), target)],
-                    value=ast.Call(
-                        func=ast.Name(id='SafeMock', ctx=ast.Load()),
-                        args=[],
-                        keywords=[
-                            ast.keyword(arg='name', value=ast.Constant(value=target.id)),
-                            ast.keyword(arg='root', value=ast.Constant(value=True))
-                        ]
-                    )
+            except_body = [ast.Assign(
+                targets=[ast.copy_location(ast.Name(id=target.id, ctx=ast.Store()), target)],
+                value=ast.Call(
+                    func=ast.Name(id='SafeMock', ctx=ast.Load()),
+                    args=[],
+                    keywords=[
+                        ast.keyword(arg='name', value=ast.Constant(value=target.id)),
+                        ast.keyword(arg='root', value=ast.Constant(value=True))
+                    ]
                 )
-            ]
+            )]
         else:
             except_body = [ast.Pass()]
         try_except_node = ast.Try(
@@ -355,8 +353,7 @@ class ASTTransformer(ast.NodeTransformer):
                 name=None,
                 body=except_body
             )],
-            orelse=[],
-            finalbody=[]
+            orelse=[], finalbody=[]
         )
         return ast.copy_location(try_except_node, node)
 
@@ -364,19 +361,17 @@ class ASTTransformer(ast.NodeTransformer):
         self.generic_visit(node)
         try_body = [node]
         if isinstance(node.target, ast.Name):
-            except_body = [
-                ast.Assign(
-                    targets=[ast.copy_location(ast.Name(id=node.target.id, ctx=ast.Store()), node.target)],
-                    value=ast.Call(
-                        func=ast.Name(id='SafeMock', ctx=ast.Load()),
-                        args=[],
-                        keywords=[
-                            ast.keyword(arg='name', value=ast.Constant(value=node.target.id)),
-                            ast.keyword(arg='root', value=ast.Constant(value=True))
-                        ]
-                    )
+            except_body = [ast.Assign(
+                targets=[ast.copy_location(ast.Name(id=node.target.id, ctx=ast.Store()), node.target)],
+                value=ast.Call(
+                    func=ast.Name(id='SafeMock', ctx=ast.Load()),
+                    args=[],
+                    keywords=[
+                        ast.keyword(arg='name', value=ast.Constant(value=node.target.id)),
+                        ast.keyword(arg='root', value=ast.Constant(value=True))
+                    ]
                 )
-            ]
+            )]
         else:
             except_body = [ast.Pass()]
         try_except_node = ast.Try(
@@ -386,12 +381,12 @@ class ASTTransformer(ast.NodeTransformer):
                 name=None,
                 body=except_body
             )],
-            orelse=[],
-            finalbody=[]
+            orelse=[], finalbody=[]
         )
         return ast.copy_location(try_except_node, node)
 
 def collect_defined_names(tree):
+    """Collects all names defined in the script."""
     defined_names = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
@@ -403,6 +398,8 @@ def collect_defined_names(tree):
     return defined_names
 
 def transform_ast(script, target_functions):
+    """Parses and transforms the AST to intercept function/method calls and
+    wrap vulnerable constructs in try/except blocks."""
     try:
         tree = ast.parse(dedent(script))
     except Exception as e:
@@ -466,6 +463,7 @@ def remove_duplicates(input_list):
             result.append(item)
     return result
 
+# --- Example script ---
 script = '''import sys
 import json
 import logging
@@ -510,6 +508,7 @@ class AdvancedDataWriter(DataProcessor):
 
     @log_execution_time
     def write_to_glue(self, df, database, table, path, mode="overwrite"):
+        # Example: f-string references an undefined variable 'a'
         df.write.format("parquet").mode(mode).option("path", path).saveAsTable(f"{database}.{a}")
         self.write_count += 1
         self.update_metric("records_written", df.count())
@@ -607,7 +606,7 @@ class MultiTableETL(DataProcessor):
 
     @log_execution_time
     def enrich_with_time_features(self, df):
-        current_date = int(str(datetime.now().strftime("%Y-%m-%d")))
+        current_date = datetime.now().strftime("%Y-%m-%d")
         enriched_df = df.withColumn("processing_time", F.lit(datetime.now().isoformat()))
         enriched_df = enriched_df.withColumn("processing_date", F.lit(current_date))
         return enriched_df
@@ -722,6 +721,7 @@ else:
         logger.error("Errors encountered:\\n" + json.dumps(etl_job.error_logs, indent=2))
 
     spark.stop()
+    job.commit()
 '''
 
 scripts = [script]
