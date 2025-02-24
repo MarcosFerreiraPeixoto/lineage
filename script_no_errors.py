@@ -140,8 +140,6 @@ class TerminalSafeMock(SafeMock):
 
 # --- Custom global namespace that returns SafeMock for missing names ---
 class SafeExecutionNamespace(dict):
-    # Reserve these names so that lookups for built-ins (especially exceptions)
-    # return the real objects rather than SafeMock.
     _reserved = {"Exception", "BaseException", "ArithmeticError", "LookupError",
                  "AssertionError", "AttributeError", "EOFError", "FloatingPointError",
                  "GeneratorExit", "ImportError", "ModuleNotFoundError", "IndexError",
@@ -154,15 +152,13 @@ class SafeExecutionNamespace(dict):
     
     def __missing__(self, key):
         if key in self._reserved:
-            # Return the actual built-in exception type.
             return getattr(builtins, key)
         new_mock = SafeMock(name=key)
         self[key] = new_mock
         return new_mock
 
 def create_mock_namespace():
-    """Creates a global namespace for execution that automatically supplies SafeMock
-    instances for any missing variable. Also includes our mock tracking functions."""
+    """Creates a global namespace that supplies SafeMock instances for missing names."""
     mock_registry = []
     
     def create_and_register_mock(func_name):
@@ -181,7 +177,6 @@ def create_mock_namespace():
             return new_mock
         return wrapper
 
-    # Explicitly add some built-in exception types and other builtins.
     initial_namespace = {
         'mock_registry': mock_registry,
         'create_and_register_mock': create_and_register_mock,
@@ -195,15 +190,38 @@ def create_mock_namespace():
     
     return SafeExecutionNamespace(initial_namespace)
 
+# --- Helper: wrap a statement in a try/except block ---
+def wrap_stmt_in_try(stmt):
+    return ast.Try(
+        body=[stmt],
+        handlers=[ast.ExceptHandler(
+            type=ast.Name(id='Exception', ctx=ast.Load()),
+            name=None,
+            body=[ast.Pass()]
+        )],
+        orelse=[],
+        finalbody=[]
+    )
+
 class ASTTransformer(ast.NodeTransformer):
-    """Transforms the AST to intercept target function/method calls and wraps
-    assignments in try/except blocks so that errors result in a SafeMock being
-    assigned instead of stopping execution."""
+    """Transforms the AST to intercept target function/method calls and to wrap
+    vulnerable constructs (including all statements in __init__ methods) so that errors
+    result in SafeMock assignments rather than aborting execution."""
     def __init__(self, target_functions, defined_names):
         self.target_functions = target_functions
         self.defined_names = defined_names
 
     def visit_Module(self, node):
+        self.generic_visit(node)
+        return node
+
+    def visit_FunctionDef(self, node):
+        # If this is an __init__ method, wrap each statement in its body in try/except.
+        if node.name == '__init__':
+            new_body = []
+            for stmt in node.body:
+                new_body.append(wrap_stmt_in_try(stmt))
+            node.body = new_body
         self.generic_visit(node)
         return node
 
@@ -398,8 +416,12 @@ def collect_defined_names(tree):
     return defined_names
 
 def transform_ast(script, target_functions):
-    """Parses and transforms the AST to intercept function/method calls and
-    wrap vulnerable constructs in try/except blocks."""
+    """
+    Parses and transforms the AST to intercept function/method calls and wrap
+    vulnerable constructs in try/except blocks.
+    """
+    # Replace tabs with spaces to help fix indentation issues.
+    script = script.replace('\t', '    ')
     try:
         tree = ast.parse(dedent(script))
     except Exception as e:
@@ -721,7 +743,6 @@ else:
         logger.error("Errors encountered:\\n" + json.dumps(etl_job.error_logs, indent=2))
 
     spark.stop()
-    job.commit()
 '''
 
 scripts = [script]
